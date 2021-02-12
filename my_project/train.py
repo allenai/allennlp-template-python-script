@@ -1,11 +1,13 @@
 # This file contains a bunch of build_* methods that configure objects however you want, and a
 # run_training_loop method that calls these methods and runs the trainer.
 
+from itertools import chain
 from typing import Iterable, Tuple
 
 import allennlp
 import torch
 from allennlp.data import DataLoader, DatasetReader, Instance, Vocabulary
+from allennlp.data.data_loaders import MultiProcessDataLoader
 from allennlp.models import Model
 from allennlp.modules.seq2vec_encoders import BagOfEmbeddingsEncoder
 from allennlp.modules.token_embedders import Embedding
@@ -21,38 +23,34 @@ def build_dataset_reader() -> DatasetReader:
     return ClassificationTsvReader()
 
 
-def read_data(
-    reader: DatasetReader
-) -> Tuple[Iterable[Instance], Iterable[Instance]]:
-    print("Reading data")
-    training_data = reader.read("/path/to/your/training/data")
-    validation_data = reader.read("/path/to/your/validation/data")
-    return training_data, validation_data
-
-
-def build_vocab(instances: Iterable[Instance]) -> Vocabulary:
+def build_vocab(train_loader, dev_loader) -> Vocabulary:
     print("Building the vocabulary")
-    return Vocabulary.from_instances(instances)
+    return Vocabulary.from_instances(
+        chain(train_loader.iter_instances(), dev_loader.iter_instances())
+    )
 
 
 def build_model(vocab: Vocabulary) -> Model:
     print("Building the model")
     vocab_size = vocab.get_vocab_size("tokens")
     embedder = BasicTextFieldEmbedder(
-        {"tokens": Embedding(embedding_dim=10, num_embeddings=vocab_size)})
+        {"tokens": Embedding(embedding_dim=10, num_embeddings=vocab_size)}
+    )
     encoder = BagOfEmbeddingsEncoder(embedding_dim=10)
     return SimpleClassifier(vocab, embedder, encoder)
 
 
 def build_data_loaders(
-    train_data: torch.utils.data.Dataset,
-    dev_data: torch.utils.data.Dataset,
-) -> Tuple[allennlp.data.DataLoader, allennlp.data.DataLoader]:
-    # Note that DataLoader is imported from allennlp above, *not* torch.
-    # We need to get the allennlp-specific collate function, which is
-    # what actually does indexing and batching.
-    train_loader = DataLoader(train_data, batch_size=8, shuffle=True)
-    dev_loader = DataLoader(dev_data, batch_size=8, shuffle=False)
+    reader,
+    train_data_path: str,
+    validation_data_path: str,
+) -> Tuple[DataLoader, DataLoader]:
+    train_loader = MultiProcessDataLoader(
+        reader, train_data_path, batch_size=8, shuffle=True
+    )
+    dev_loader = MultiProcessDataLoader(
+        reader, validation_data_path, batch_size=8, shuffle=False
+    )
     return train_loader, dev_loader
 
 
@@ -60,13 +58,10 @@ def build_trainer(
     model: Model,
     serialization_dir: str,
     train_loader: DataLoader,
-    dev_loader: DataLoader
+    dev_loader: DataLoader,
 ) -> Trainer:
-    parameters = [
-        [n, p]
-        for n, p in model.named_parameters() if p.requires_grad
-    ]
-    optimizer = AdamOptimizer(parameters)
+    parameters = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    optimizer = AdamOptimizer(parameters)  # type: ignore
     # There are a *lot* of other things you could configure with the trainer.  See
     # http://docs.allennlp.org/master/api/training/trainer/#gradientdescenttrainer-objects for more
     # information.
@@ -84,32 +79,22 @@ def build_trainer(
 
 
 def run_training_loop(serialization_dir: str):
-    dataset_reader = build_dataset_reader()
+    reader = build_dataset_reader()
 
-    # These are a subclass of pytorch Datasets, with some allennlp-specific
-    # functionality added.
-    train_data, dev_data = read_data(dataset_reader)
+    train_loader, dev_loader = build_data_loaders(
+        reader, "/path/to/your/training/data", "/path/to/your/validation/data"
+    )
 
-    vocab = build_vocab(train_data + dev_data)
+    vocab = build_vocab(train_loader, dev_loader)
     model = build_model(vocab)
 
     # This is the allennlp-specific functionality in the Dataset object;
     # we need to be able convert strings in the data to integers, and this
     # is how we do it.
-    train_data.index_with(vocab)
-    dev_data.index_with(vocab)
+    train_loader.index_with(vocab)
+    dev_loader.index_with(vocab)
 
-    # These are again a subclass of pytorch DataLoaders, with an
-    # allennlp-specific collate function, that runs our indexing and
-    # batching code.
-    train_loader, dev_loader = build_data_loaders(train_data, dev_data)
-
-    trainer = build_trainer(
-        model,
-        serialization_dir,
-        train_loader,
-        dev_loader
-    )
+    trainer = build_trainer(model, serialization_dir, train_loader, dev_loader)
 
     # NOTE: Training using multiple GPUs is hard in this setting.  If you want multi-GPU training,
     # we recommend using our config file template instead, which handles this case better, as well
